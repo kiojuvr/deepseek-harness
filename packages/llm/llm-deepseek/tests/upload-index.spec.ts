@@ -62,6 +62,25 @@ describe('DeepSeekUploadIndex', () => {
     await expect(index.get(scope, VARIANT, 2, 1)).resolves.toBeUndefined()
   })
 
+  it('preserves a concurrently installed successor generation when an older generation is invalidated', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-upload-index-'))
+    roots.push(dir)
+    const index = new DeepSeekUploadIndex(join(dir, 'index.json'))
+    const scope = deepSeekFileScope('https://api.deepseek.com', 'key')
+    const base = {
+      scope, attachmentId: ATTACHMENT, variantId: VARIANT, bytes: 3, createdAt: 1, expiresAt: 10_000,
+    }
+    const used = { ...base, fileId: DeepSeekFileId('file-api-used') }
+    const successor = { ...base, fileId: DeepSeekFileId('file-api-successor') }
+    await index.commit(used, 1, 1)
+    await index.remove(scope, [{ variantId: VARIANT, fileId: used.fileId }])
+    await index.commit(successor, 2, 1)
+
+    await index.remove(scope, [{ variantId: VARIANT, fileId: used.fileId }])
+
+    await expect(index.get(scope, VARIANT, 2, 1)).resolves.toEqual(successor)
+  })
+
   it('removes several exact generations in one update and keeps unlisted mappings', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'dsh-upload-index-'))
     roots.push(dir)

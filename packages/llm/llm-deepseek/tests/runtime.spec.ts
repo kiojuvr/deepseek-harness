@@ -916,7 +916,7 @@ describe('DeepSeekAdapter against a mock server', () => {
     expect(JSON.stringify(server.requests[1])).toContain('base64')
   })
 
-  it('invalidates only the identified mapping when a multi-image request names one stale file id', async () => {
+  it('invalidates every mapping used by the failed attempt when a multi-image request names one stale file id', async () => {
     const secondRef: ImageAttachmentRef = {
       ...imageRef,
       attachmentId: AttachmentId(`sha256:${'c'.repeat(64)}`),
@@ -950,15 +950,15 @@ describe('DeepSeekAdapter against a mock server', () => {
       })],
     }))
 
-    expect(server.fileRequests.filter(request => request.method === 'POST')).toHaveLength(3)
+    expect(server.fileRequests.filter(request => request.method === 'POST')).toHaveLength(4)
     const retries = server.requests as Array<{ messages: Array<{ content: Array<{ type: string; file_id?: string }> }> }>
     expect(retries[0]?.messages[0]?.content.filter(block => block.type === 'image'))
       .toEqual([{ type: 'image', source: { type: 'file', file_id: 'file-api-1' } }, { type: 'image', source: { type: 'file', file_id: 'file-api-2' } }])
     expect(retries[1]?.messages[0]?.content.filter(block => block.type === 'image'))
-      .toEqual([{ type: 'image', source: { type: 'file', file_id: 'file-api-1' } }, { type: 'image', source: { type: 'file', file_id: 'file-api-3' } }])
+      .toEqual([{ type: 'image', source: { type: 'file', file_id: 'file-api-3' } }, { type: 'image', source: { type: 'file', file_id: 'file-api-4' } }])
   })
 
-  it('invalidates every listed missing file id and preserves unlisted mappings', async () => {
+  it('invalidates every mapping used by the failed attempt when the provider lists missing file ids', async () => {
     const secondRef: ImageAttachmentRef = {
       ...imageRef,
       attachmentId: AttachmentId(`sha256:${'c'.repeat(64)}`),
@@ -1007,7 +1007,7 @@ describe('DeepSeekAdapter against a mock server', () => {
       })],
     }))
 
-    expect(server.fileRequests.filter(request => request.method === 'POST')).toHaveLength(5)
+    expect(server.fileRequests.filter(request => request.method === 'POST')).toHaveLength(6)
     const retries = server.requests as Array<{ messages: Array<{ content: Array<{ type: string; file_id?: string }> }> }>
     expect(retries[0]?.messages[0]?.content.filter(block => block.type === 'image'))
       .toEqual([
@@ -1018,8 +1018,8 @@ describe('DeepSeekAdapter against a mock server', () => {
     expect(retries[1]?.messages[0]?.content.filter(block => block.type === 'image'))
       .toEqual([
         { type: 'image', source: { type: 'file', file_id: 'file-api-4' } },
-        { type: 'image', source: { type: 'file', file_id: 'file-api-2' } },
         { type: 'image', source: { type: 'file', file_id: 'file-api-5' } },
+        { type: 'image', source: { type: 'file', file_id: 'file-api-6' } },
       ])
   })
 
@@ -1062,16 +1062,13 @@ describe('DeepSeekAdapter against a mock server', () => {
     }))
 
     expect(server.requests).toHaveLength(2)
-    expect(server.fileRequests.filter(request => request.method === 'POST')).toHaveLength(70)
+    expect(server.fileRequests.filter(request => request.method === 'POST')).toHaveLength(80)
     const attempts = server.requests as Array<{ messages: Array<{ content: Array<{ type: string; source?: { file_id?: string } }> }> }>
     const fileIds = (attempt: number) => attempts[attempt]?.messages[0]?.content
       .filter(block => block.type === 'image')
       .map(block => block.source?.file_id)
     expect(fileIds(0)).toEqual(refs.map((_, index) => `file-api-${index + 1}`))
-    expect(fileIds(1)).toEqual([
-      ...missing.map((_, index) => `file-api-${41 + index}`),
-      ...refs.slice(30).map((_, index) => `file-api-${31 + index}`),
-    ])
+    expect(fileIds(1)).toEqual(refs.map((_, index) => `file-api-${41 + index}`))
   })
 
   it('invalidates every used mapping when a stale-file response does not identify one file id', async () => {

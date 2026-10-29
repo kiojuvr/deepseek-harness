@@ -50,11 +50,15 @@ function detailNamesFileId(detail: string, fileId: DeepSeekFileId): boolean {
   return false
 }
 
+function usedMappings(files: readonly UsedRequestFile[]): UsedRequestFile[] {
+  return [...new Map(files.map(file => [`${file.version.variantId}\0${file.fileId}`, file])).values()]
+}
+
 function staleMappings(
   files: readonly UsedRequestFile[],
   detail: string,
 ): UsedRequestFile[] {
-  const unique = [...new Map(files.map(file => [`${file.version.variantId}\0${file.fileId}`, file])).values()]
+  const unique = usedMappings(files)
   const exact = unique.filter(file => detailNamesFileId(detail, file.fileId))
   return exact.length > 0 ? exact : unique
 }
@@ -128,14 +132,15 @@ export class RequestFiles {
   }
 
   /**
-   * Invalidate every rejected mapping in one index update; only the first stale-id response permits another request.
+   * Invalidate every mapping used by the first failed attempt, and only named mappings on a terminal second response.
    * @param detail - provider error fields used for stale-id classification.
    * @returns whether the caller should serialize and dispatch again.
    */
   async retry(detail: string): Promise<boolean> {
     if (this.used.length === 0 || !providerRejectedFileId(detail)) return false
+    const rejected = this.retried ? staleMappings(this.used, detail) : usedMappings(this.used)
     await this.files.invalidate(
-      staleMappings(this.used, detail).map(file => ({ variantId: file.version.variantId, fileId: file.fileId })),
+      rejected.map(file => ({ variantId: file.version.variantId, fileId: file.fileId })),
       this.connection,
     )
     if (this.retried) return false

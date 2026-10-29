@@ -113,6 +113,28 @@ describe('DeepSeekFileStore', () => {
     expect(remote.uploads()).toBe(4)
   })
 
+  it('invalidates exact mappings locally without a remote delete', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dsh-file-invalidate-'))
+    roots.push(dir)
+    const index = new DeepSeekUploadIndex(join(dir, 'index.json'))
+    const remote = uploadFetch()
+    const store = new DeepSeekFileStore({ index, now: () => NOW, fetch: remote.fetchImpl })
+    const alternate = { ...VERSION, variantId: ImageVariantId(`sha256:${'c'.repeat(64)}`) }
+    const first = await store.ensureUploaded(VERSION, CONNECTION, POLICY)
+    const second = await store.ensureUploaded(alternate, CONNECTION, POLICY)
+    const scope = deepSeekFileScope(`${CONNECTION.baseURL}/v1`, JSON.stringify(Object.entries(CONNECTION.headers)))
+
+    await store.invalidate([
+      { variantId: VERSION.variantId, fileId: first.record.fileId },
+      { variantId: alternate.variantId, fileId: second.record.fileId },
+    ], CONNECTION)
+
+    expect(remote.uploads()).toBe(2)
+    expect(vi.mocked(remote.fetchImpl).mock.calls.every(([, init]) => init?.method === 'POST')).toBe(true)
+    await expect(index.get(scope, VERSION.variantId, NOW, 0)).resolves.toBeUndefined()
+    await expect(index.get(scope, alternate.variantId, NOW, 0)).resolves.toBeUndefined()
+  })
+
   it('reclaims the oldest owned native file across descending pages before retrying an upload', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'dsh-native-file-quota-'))
     roots.push(dir)

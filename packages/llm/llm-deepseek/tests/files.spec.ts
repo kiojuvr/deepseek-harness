@@ -27,13 +27,11 @@ function body(init: RequestInit | undefined): string {
   return init.body
 }
 const rejected = (message: string, status = 400) => new Response(JSON.stringify({ error: { type: 'invalid_request_error', message } }), { status })
-function harness(config: Config = {}) {
-  const ensureUploaded = vi.fn<DeepSeekFileStore['ensureUploaded']>(async image => ({
-    record: { fileId: DeepSeekFileId(image.attachment.attachmentId === ref.attachmentId ? 'file-a' : 'file-b') }, uploaded: false,
-  } as Awaited<ReturnType<DeepSeekFileStore['ensureUploaded']>>))
-  const invalidate = vi.fn<DeepSeekFileStore['invalidate']>(async () => {})
-  const files = Object.assign(new DeepSeekFileStore(), { ensureUploaded, invalidate })
-  const readImageRequest = vi.fn(async (attachment: ImageAttachmentRef) => version(attachment))
+function harnessWith(
+  files: DeepSeekFileStore,
+  readImageRequest: (attachment: ImageAttachmentRef) => Promise<RequestImageAttachment>,
+  config: Config = {},
+) {
   // The codec and remote upload are the expensive boundaries; request projection and recovery stay real.
   const attachments = requestImageStore(readImageRequest)
   const prepare = vi.fn(prepareExtensions)
@@ -42,7 +40,41 @@ function harness(config: Config = {}) {
     resolveAuth: async () => ({ headers: { 'x-api-key': 'test-key' } }), resolveUserId: () => 'test-user' as AnonymousUserId, resolveAttachments: () => attachments,
     resolveImageAccess: () => ({ readonlyPath: '/workspace/image.png' }), resolveFiles: () => files, prepareExtensions: prepare,
   })
-  return { adapter, ensureUploaded, invalidate, readImageRequest, prepare }
+  return { adapter, prepare }
+}
+function harness(config: Config = {}) {
+  const ensureUploaded = vi.fn<DeepSeekFileStore['ensureUploaded']>(async image => ({
+    record: { fileId: DeepSeekFileId(image.attachment.attachmentId === ref.attachmentId ? 'file-a' : 'file-b') }, uploaded: false,
+  } as Awaited<ReturnType<DeepSeekFileStore['ensureUploaded']>>))
+  const invalidate = vi.fn<DeepSeekFileStore['invalidate']>(async () => {})
+  const files = Object.assign(new DeepSeekFileStore(), { ensureUploaded, invalidate })
+  const readImageRequest = vi.fn(async (attachment: ImageAttachmentRef) => version(attachment))
+  return { ...harnessWith(files, readImageRequest, config), ensureUploaded, invalidate, readImageRequest }
+}
+function staleFiles(initial: readonly (readonly [RequestImageAttachment, string])[]) {
+  const cache = new Map<RequestImageAttachment['variantId'], DeepSeekFileId>()
+  for (const [image, fileId] of initial) cache.set(image.variantId, DeepSeekFileId(fileId))
+  let uploads = 0
+  const ensureUploaded = vi.fn<DeepSeekFileStore['ensureUploaded']>(async (image) => {
+    const cached = cache.get(image.variantId)
+    if (cached !== undefined) {
+      return { record: { fileId: cached }, uploaded: false } as Awaited<ReturnType<DeepSeekFileStore['ensureUploaded']>>
+    }
+    const fileId = DeepSeekFileId(`file-uploaded-${++uploads}`)
+    cache.set(image.variantId, fileId)
+    return { record: { fileId }, uploaded: true } as Awaited<ReturnType<DeepSeekFileStore['ensureUploaded']>>
+  })
+  const invalidate = vi.fn<DeepSeekFileStore['invalidate']>(async (generations) => {
+    for (const generation of generations) {
+      if (cache.get(generation.variantId) === generation.fileId) cache.delete(generation.variantId)
+    }
+  })
+  return {
+    store: Object.assign(new DeepSeekFileStore(), { ensureUploaded, invalidate }),
+    ensureUploaded,
+    invalidate,
+    cache,
+  }
 }
 afterEach(() => { vi.unstubAllGlobals() })
 
@@ -68,12 +100,15 @@ describe('Messages Files requests', () => {
     expect(body(init)).not.toContain('base64')
   })
 
-  it('invalidates the named stale id once and prepares extensions for each HTTP attempt', async () => {
+  it('invalidates every mapping used by the first failed attempt and prepares extensions for each HTTP attempt', async () => {
     const fetchImpl = vi.fn<typeof fetch>().mockResolvedValueOnce(rejected('file-a expired')).mockImplementation(async () => success())
     vi.stubGlobal('fetch', fetchImpl)
     const h = harness()
     await chunks(h.adapter.stream(request([ref, second])))
-    expect(h.invalidate).toHaveBeenCalledExactlyOnceWith([{ variantId: version(ref).variantId, fileId: 'file-a' }], expect.objectContaining({}))
+    expect(h.invalidate).toHaveBeenCalledExactlyOnceWith([
+      { variantId: version(ref).variantId, fileId: 'file-a' },
+      { variantId: version(second).variantId, fileId: 'file-b' },
+    ], expect.objectContaining({}))
     expect(fetchImpl).toHaveBeenCalledTimes(2)
     expect(h.prepare).toHaveBeenCalledTimes(2)
     expect(h.ensureUploaded).toHaveBeenCalledTimes(4)
@@ -87,6 +122,150 @@ describe('Messages Files requests', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(2)
     expect(h.invalidate.mock.calls.map(call => call[0].length)).toEqual([2, 2])
     expect(fetchImpl.mock.calls.every(call => !body(call[1]).includes('base64'))).toBe(true)
+  })
+
+  it('recovers every stale mapping used by the failed attempt in one replacement request', async () => {
+    const files = staleFiles([[version(ref), 'file-a'], [version(second), 'file-b']])
+    let attempt = 0
+    const fetchImpl = vi.fn<typeof fetch>(async (_url, init) => {
+      attempt += 1
+      if (attempt === 1) return rejected('file_id file-a expired')
+      return body(init).includes('"file_id":"file-b"') ? rejected('file_id file-b expired') : success()
+    })
+    vi.stubGlobal('fetch', fetchImpl)
+    const h = harnessWith(files.store, async attachment => version(attachment))
+    const original = request([ref, second])
+    const saved = JSON.stringify(original.messages)
+
+    await chunks(h.adapter.stream(original))
+
+    expect(fetchImpl).toHaveBeenCalledTimes(2)
+    expect(files.invalidate).toHaveBeenCalledExactlyOnceWith([
+      { variantId: version(ref).variantId, fileId: 'file-a' },
+      { variantId: version(second).variantId, fileId: 'file-b' },
+    ], expect.objectContaining({}))
+    expect(files.ensureUploaded).toHaveBeenCalledTimes(4)
+    expect(fetchImpl.mock.calls.every(([, init]) => init?.method === 'POST')).toBe(true)
+    expect(JSON.stringify(original.messages)).toBe(saved)
+  })
+
+  it('recovers three stale file ids within the same single replacement request', async () => {
+    const third = { ...ref, attachmentId: AttachmentId(`sha256:${'e'.repeat(64)}`) }
+    const thirdVersion = { ...version(third), variantId: ImageVariantId(`sha256:${'e'.repeat(64)}`) }
+    const files = staleFiles([
+      [version(ref), 'file-a'],
+      [version(second), 'file-b'],
+      [thirdVersion, 'file-c'],
+    ])
+    let attempt = 0
+    const fetchImpl = vi.fn<typeof fetch>(async (_url, init) => {
+      attempt += 1
+      if (attempt === 1) return rejected('file_id file-a expired')
+      return /"file_id":"file-[abc]"/u.test(body(init)) ? rejected('file_id file-b expired') : success()
+    })
+    vi.stubGlobal('fetch', fetchImpl)
+    const h = harnessWith(files.store, async attachment => (
+      attachment.attachmentId === third.attachmentId ? thirdVersion : version(attachment)
+    ))
+
+    await chunks(h.adapter.stream(request([ref, second, third])))
+
+    expect(fetchImpl).toHaveBeenCalledTimes(2)
+    expect(files.invalidate).toHaveBeenCalledExactlyOnceWith([
+      { variantId: version(ref).variantId, fileId: 'file-a' },
+      { variantId: version(second).variantId, fileId: 'file-b' },
+      { variantId: thirdVersion.variantId, fileId: 'file-c' },
+    ], expect.objectContaining({}))
+    expect(files.ensureUploaded).toHaveBeenCalledTimes(6)
+  })
+
+  it('invalidates only mappings used by the failed attempt and preserves unrelated cached mappings', async () => {
+    const unrelated = { ...ref, attachmentId: AttachmentId(`sha256:${'f'.repeat(64)}`) }
+    const unrelatedVersion = { ...version(unrelated), variantId: ImageVariantId(`sha256:${'f'.repeat(64)}`) }
+    const files = staleFiles([
+      [version(ref), 'file-a'],
+      [version(second), 'file-b'],
+      [unrelatedVersion, 'file-unrelated'],
+    ])
+    let attempt = 0
+    const fetchImpl = vi.fn<typeof fetch>(async (_url, init) => {
+      attempt += 1
+      if (attempt === 1) return rejected('file_id file-a expired')
+      return body(init).includes('"file_id":"file-b"') ? rejected('file_id file-b expired') : success()
+    })
+    vi.stubGlobal('fetch', fetchImpl)
+    const h = harnessWith(files.store, async attachment => (
+      attachment.attachmentId === unrelated.attachmentId ? unrelatedVersion : version(attachment)
+    ))
+
+    await chunks(h.adapter.stream(request([ref, second])))
+
+    expect(files.invalidate).toHaveBeenCalledExactlyOnceWith([
+      { variantId: version(ref).variantId, fileId: 'file-a' },
+      { variantId: version(second).variantId, fileId: 'file-b' },
+    ], expect.objectContaining({}))
+    expect(files.cache.get(unrelatedVersion.variantId)).toBe('file-unrelated')
+  })
+
+  it('deduplicates repeated occurrences of one stale image during invalidation', async () => {
+    const files = staleFiles([[version(ref), 'file-a']])
+    let attempt = 0
+    const fetchImpl = vi.fn<typeof fetch>(async (_url, init) => {
+      attempt += 1
+      if (attempt === 1) return rejected('file_id file-a expired')
+      return body(init).includes('"file_id":"file-a"') ? rejected('file_id file-a expired') : success()
+    })
+    vi.stubGlobal('fetch', fetchImpl)
+    const h = harnessWith(files.store, async attachment => version(attachment))
+
+    await chunks(h.adapter.stream(request([ref, ref])))
+
+    expect(files.invalidate).toHaveBeenCalledExactlyOnceWith([
+      { variantId: version(ref).variantId, fileId: 'file-a' },
+    ], expect.objectContaining({}))
+    expect(files.ensureUploaded).toHaveBeenCalledTimes(4)
+  })
+
+  it('invalidates only the named mapping on a second stale rejection and makes no third request', async () => {
+    const files = staleFiles([[version(ref), 'file-a'], [version(second), 'file-b']])
+    let attempt = 0
+    const fetchImpl = vi.fn<typeof fetch>(async (_url, init) => {
+      attempt += 1
+      const payload = body(init)
+      if (attempt === 1) return rejected('file_id file-a expired')
+      if (payload.includes('"file_id":"file-uploaded-2"')) return rejected('file_id file-uploaded-2 expired')
+      if (payload.includes('"file_id":"file-b"')) return rejected('file_id file-b expired')
+      return success()
+    })
+    vi.stubGlobal('fetch', fetchImpl)
+    const h = harnessWith(files.store, async attachment => version(attachment))
+
+    await expect(chunks(h.adapter.stream(request([ref, second])))).rejects.toMatchObject({ code: 'INVALID_REQUEST' })
+
+    expect(fetchImpl).toHaveBeenCalledTimes(2)
+    expect(files.ensureUploaded).toHaveBeenCalledTimes(4)
+    expect(files.invalidate.mock.calls.map(call => call[0])).toEqual([
+      [
+        { variantId: version(ref).variantId, fileId: 'file-a' },
+        { variantId: version(second).variantId, fileId: 'file-b' },
+      ],
+      [{ variantId: version(second).variantId, fileId: 'file-uploaded-2' }],
+    ])
+  })
+
+  it('does not invalidate files for a non-stale provider error', async () => {
+    const files = staleFiles([[version(ref), 'file-a']])
+    const fetchImpl = vi.fn<typeof fetch>(async () => new Response(
+      JSON.stringify({ error: { message: 'provider overloaded' } }),
+      { status: 500 },
+    ))
+    vi.stubGlobal('fetch', fetchImpl)
+    const h = harnessWith(files.store, async attachment => version(attachment))
+
+    await expect(chunks(h.adapter.stream(request()))).rejects.toMatchObject({ code: 'SERVER' })
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+    expect(files.invalidate).not.toHaveBeenCalled()
   })
 
   it('attributes normalized-image rejection without retrying its bytes as inline', async () => {
